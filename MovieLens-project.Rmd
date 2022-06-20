@@ -1,0 +1,667 @@
+---
+title: "Movie Lens edx project"
+author: "Andree Flores"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+RMSE_target <- 0.86490
+```
+
+# Intoduction
+
+This is a project for the course HarvardX PH125.9x Data Science: Capstone.
+The project consist in use the MovieLens database with the objective of predict movie ratings. The database consist of 10 million ratings from more than 70,000 users and 10,000 movies.  
+
+The goal of the project is to predict the rating a user give to some movie with the intention of create a movie recommendation algorithm. And this algorithm needs to have a RMSE lower of `r RMSE_target` in order to get all the points of this part.
+
+The residual mean squared error (RMSE) is used as the error loss function of this project. Where $y_{u,i}$ is the rating for movie i by user u and $\hat y_{u,i}$ is the prediction made by the model.
+
+$$
+RMSE = \sqrt{ \frac{1}{N} \sum_{u,i} (\hat y_{u,i} - y_{u,i})^2 }
+$$
+
+Initially the data set has the following columns:
+
++ userId, which is a integer number unique for each user
++ movieId, which is a integer number unique for each movie
++ rating, which is a number between 0.5 and 5 with 0.5 increments, like stars
++ timestamp, which is the time when the rating was made
++ title, which is the title of the movie and the year of release
++ genres, which a string with | as separators of the genres of the movie
+
+And the columns that I added after are:
+
++ releaseyear, which is a integer number that represents the year release of the movie (unique for each movieId), extracted from the title column.
++ unique_ans, which is a integer number that represents how many different ratings that user has made, I added it during the downloading of the data to avoid having different values in the edx and validation edx for an specific userId, but in practice could be different.
+
+The variables I decided to use for my model were: userId, movieId, genres, releaseyear and unique_ans, the reason I didn't use title is because it would be the same thing as using the movieId and for timestamp is because I found some ratings that were made before the movie was release.
+
+I decided to make a linear model, whose justification will be found in the Model approach section.
+
+# Methods/Analysis
+
+## Data download and data cleaning
+
+Following the instructions provided, we can download the data set and process it:
+```{r packages, echo=FALSE,warning=FALSE,message=FALSE}
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+
+library(tidyverse)
+library(caret)
+library(data.table)
+library(stringr)
+library(lubridate)
+```
+
+```{r download,warning=FALSE,message=FALSE,tidy=TRUE,tidy.opts=list(width.cutoff=70)}
+#MovieLens 10M dataset:
+#https://grouplens.org/datasets/movielens/10m/
+#http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("https://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+###Added after analysis but it was put here to avoid modify the edx and validation separated and having different values in the variable unique ratings
+#release year
+movielens <- movielens %>% mutate(releaseyear = as.numeric(str_extract(str_extract(title, "[/(]\\d{4}[/)]$"), regex("\\d{4}"))),title = str_remove(title, "[/(]\\d{4}[/)]$"))
+#unique ratings
+movielens <- movielens %>% group_by(userId) %>% 
+  mutate(unique_ans = n_distinct(rating)) %>% ungroup()
+
+#Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+#Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+#Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+```{r, echo=FALSE}
+  head(edx %>% select(userId,movieId,rating,timestamp,title,genres))
+```
+
+## Data Analysis
+
+All the following analysis were made using edx data set.
+
+### Year of release
+As we can see the year of release is in the title column, we can move the year to a new column and therefore use it in the analysis.
+
+```{r add_year, eval=FALSE,tidy=TRUE, tidy.opts=list(width.cutoff=80)}
+###Extract the year of release from the title variable
+edx <- edx %>% mutate(releaseyear = as.numeric(str_extract(str_extract(title, "[/(]\\d{4}[/)]$"), regex("\\d{4}"))),title = str_remove(title, "[/(]\\d{4}[/)]$"))
+
+```
+
+```{r mean_rating_year, echo=FALSE,fig.width=8,fig.height=4}
+###plot of mean of the ratings vs the year of release of each movie
+plot_point <- edx %>% group_by(movieId) %>% add_count(rating) %>%
+  mutate(mean_rating=mean(rating)) %>%
+  select(movieId,title,releaseyear,n,mean_rating) %>% ungroup() %>% unique() %>%
+  ggplot(aes(releaseyear,mean_rating)) +
+  geom_point(alpha=0.0875,colour = "blue") +
+  ggtitle("Mean rating of each movie") +
+  ylab("Mean rating of each movie") +
+  xlab("Year of release")
+
+plot_point + edx %>% group_by(movieId) %>% mutate(mean_rating=mean(rating)) %>% 
+  ungroup() %>% group_by(releaseyear) %>% 
+  summarise(mean_year = mean(mean_rating), .groups='keep') %>%
+  geom_line(mapping=aes(releaseyear,mean_year),size=1,alpha=0.8)
+
+remove(plot_point)
+```
+
+In this plot each point is a movie, and the black line follows the average rating of all movies released in each year. We can see that:
+
+* There are more movies in recent years.
+* Older movies tend to have a greater mean rating.
+* In general newer movies have a greater variance in their rating, but the average remains almost the same, with a fall of around 0.25. 
+
+### Unique ratings
+
+We can group the users by how many different ratings has. For example: the user with userId = 1 has all ratings with a `r unique(edx[edx$userId == 1,]$rating)`, but the userId = 2 has `r length(unique(edx[edx$userId == 2,]$rating))` different ratings:
+
+```{r example_unique_ratings}
+unique(edx[edx$userId == 1,]$rating)
+
+unique(edx[edx$userId == 2,]$rating)
+```
+
+```{r add_unique_ratings, eval=FALSE}
+###How many different ratings did each user has? 
+edx <- edx %>% group_by(userId) %>% 
+  mutate(unique_ans = n_distinct(rating)) %>% ungroup()
+
+```
+
+```{r unique_ratings_graph, echo=FALSE,fig.width=8,fig.height=5}
+#Distribution of the groups
+ggplot(edx,aes(unique_ans)) +
+  ggtitle("Bar graph of different ratings by user") +
+  geom_bar() +
+  geom_text(aes(label = ..count..), stat = "count", vjust = -0.4, colour = "black") +
+  scale_x_discrete(name="Number of different ratings",
+                   limits = c("1","2","3","4","5","6","7","8","9","10")) +
+  ylab("Users quantity")
+```
+
+As we can see the biggest group are the users with 5 different ratings, followed by the group of 10. Is obvious that the group of 10 uses all the ratings available, but do the group of 5 has a tendency? Do the group of 5 different ratings uses only integer ratings more often? Does the group of 4 and 3 do the same?
+
+```{r, echo=FALSE,fig.width=8,fig.height=4.5}
+##Is there a relation between the number of unique answers and how users rate movies?
+
+#Create a matrix where rows are the ratings, the columns the number 
+#of unique ratings a user has, and the value is how many ratings are
+rating_m <- edx %>% group_by(unique_ans) %>% select(unique_ans,rating) %>% 
+  table() %>% matrix(10,10)
+colnames(rating_m) <- seq(0.5,5,0.5)
+rownames(rating_m) <- 1:10
+
+df <- as.data.frame(rating_m) %>% gather(key='y', value='val')
+df$x <- rep(1:10, 10)
+ggplot(df, aes(x, y, fill= log(val+1) )) + 
+  geom_tile() +
+  geom_text(aes(x, y, label=round(val,2))) +
+  scale_fill_gradient(low = "white", high = "red") + 
+  scale_x_discrete(limits = c("1","2","3","4","5","6","7","8","9","10")) +
+  ggtitle("Distribution of ratings grouped by unique_ans") +
+  ylab("Rating") +
+  xlab("Number of unique ratings") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+remove(rating_m,df)
+```
+
+As we can see for most ratings and for each group, is more common to rate a movie with a whole number than with a fraction. This can be useful especially with groups with a low number of unique ratings. But this approach could over fit the model. 
+
+For example, we could use the fact that the user with Id 1 only rates movies with a `r unique(edx[edx$userId == 1,]$rating)`, causing to create a "perfect prediction" of only `r unique(edx[edx$userId == 1,]$rating)` ratings. And with the objective of the project been a movie recommendation model, it would recommend every movie equally to this user.
+
+### Genres
+
+```{r genre_distribution0, echo=FALSE}
+genres <- edx %>% separate_rows(genres, sep = "\\|") %>%
+  select(genres)
+```
+
+Other important data for the model is the genres of the movie, especially with the personal preferences of each user. Something to highlight is that the sum of the count of all genres is greater than all the the ratings, this is because movies can have more than one genre. In total there are `r nrow(genres)` genres listed among all movies and `r n_distinct(edx$genres)` combinations of genres in the data set.
+
+```{r genre_distribution, eval=FALSE}
+genres <- edx %>% separate_rows(genres, sep = "\\|") %>%
+  select(genres)
+```
+
+```{r genre_head_tail,echo=FALSE}
+genres_combo_sorted <- as.data.frame(sort(table(edx$genres),decreasing = TRUE))
+colnames(genres_combo_sorted) <- c("Genres Combo","Frequency")
+
+genres_sorted <- as.data.frame(sort(table(genres),decreasing = TRUE))
+colnames(genres_sorted) <- c("Genres","Frequency")
+
+print("Table Combo of Genres")
+genres_combo_sorted %>% {
+  rbind(head(., 5), tail(., 5))
+} 
+
+print("Table Genres")
+genres_sorted %>% {
+  rbind(head(., 5), tail(., 5))
+} 
+```
+
+As we can see the most popular genre is `r genres_sorted[1,1]` which appear in `r genres_sorted[1,2]` in total and `r genres_combo_sorted[1,2]` as combo of genres. 
+
+Also there are some movies listed as not having genres as we can see in the last row in the Table Genres: `r genres_sorted[nrow(genres_sorted),1]` with `r genres_sorted[nrow(genres_sorted),2]` ratings, further research shows that is only one movie with this issue:
+
+```{r movies_with_no_genres}
+edx %>% filter(genres == "(no genres listed)") %>% 
+  pull(title) %>% unique()
+```
+
+```{r remove_genres, echo=FALSE}
+rm(genres,genres_combo_sorted,genres_sorted)
+```
+
+In this project I will use the combination of genres to do the prediction model. Because in this way I can use the relation between different genres more easily.
+
+### Time of rating (Timestamp)
+
+As previously said in the introduction of this project, I decided to not use this variable. The reason is that I found some irregularities that makes me doubt of this data.
+
+For example, in total `r sum((year(as_datetime(edx$timestamp)) - edx$releaseyear ) < 0)` ratings are reported to be made before the movie was released, this could be explained with the release been close to the start or end of a specific year and the rounding of the variables causes this issue. But it doesn't explain the difference of 2 years in `r sum((year(as_datetime(edx$timestamp)) - edx$releaseyear )[(year(as_datetime(edx$timestamp)) - edx$releaseyear ) < 0] == -2)` cases. I know this are few cases, but creates doubt on the veracity of this variable or in the approach I'm using, that is I'm probably writing code that is wrong but after researching I couldn't find any errors.
+
+Therefore I decided to not use this variable, unlike with the genres variable and the movie with no listed genres, as it's only 1 movie, the effect should be minimal because the movieId is also used in the model.
+
+## Methods
+
+Firstly we need to define an R function for calculating the RMSE:
+
+```{r RMSE_function}
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+
+Next I'm going to divide the edx data set, in order to avoid using the validation data set during making the model.
+
+```{r edx_datapartition}
+###Split edx, in train and test
+#Test set will be 10% of edx data
+set.seed(1, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+test_index <- createDataPartition(y = edx$rating, times = 1, p = 0.1, list = FALSE)
+train_edx <- edx[-test_index,]
+temp <- edx[test_index,]
+
+#Make sure userId and movieId in validation set are also in train_edx set
+test_edx <- temp %>% 
+  semi_join(train_edx, by = "movieId") %>%
+  semi_join(train_edx, by = "userId")
+
+#Add rows removed from test_edx set back into train_edx set
+removed <- anti_join(temp, test_edx)
+train_edx <- rbind(train_edx, removed)
+
+#Remove unnecessary variables
+rm(test_index, temp, removed)
+
+```
+
+### Model approach
+
+Due to various limitations such as memory size and not having enough RAM, I can't use models that come in the caret package in their full potential. Therefore, I choose a liner model for this project. Where:
+
++ $Y_{u,i}$ is the rating for the movie $i$ from the user $u$.
++ $\mu$ is the mean rating across all movies and users.
++ $b_i$ is the effect for movie $i$.
++ $b_u$ is the effect for user $u$.
++ $b_{g,i}$ is the effect for the unique combination of genres that the movie $i$ has. For simplicity I will label as $b_g$
++ $b_{r,i}$ is the effect for the year of release of the movie $i$. For simplicity I will label as $b_r$
++ $b_{ru,u}$ is the effect for the group of unique ratings that the user $u$ belongs. For simplicity I will label as $b_{ru}$
++ $\epsilon_{u,i}$ is the error assuming that has a mean of zero.
+
+Also we need to consider $\hat Y_{u,i}$ as the predicted rating for the movie $i$ from the user $u$.
+
+For a model that assumes the same rating for all ratings with the differences explained by random variation would look like this:
+$$
+Y_{u,i} = \mu + \epsilon_{u,i}
+$$
+
+With this model, the least squares estimate for $\mu$ is the average of all the ratings.
+
+```{r mean_rating}
+  mu <- mean(train_edx$rating)
+  naive_rmse <- RMSE(test_edx$rating,mu)
+  
+  rmse_results <- tibble(method = "Just the average", RMSE = naive_rmse)
+```
+
+Currently our prediction model looks like this:
+$$
+\hat Y_{u,i} = \hat\mu
+$$
+With a value of $\hat\mu$ equal to `r mu` and a RMSE of `r as.numeric(rmse_results[1,2])`.
+
+**Movie effect**   
+
+We can add the effect that each movie has to its own rating like this: 
+$$
+Y_{u,i} = \mu + b_i + \epsilon_{u,i}
+$$
+We can use the fact that for this linear model the least squares estimate of $b_i$ is just the average of $Y_{u,i}-\hat\mu$ for each movie $i$.
+
+```{r movie_effect}
+  b_i <- train_edx %>%
+    group_by(movieId) %>%
+    summarize(b_i = mean(rating - mu), .groups = "keep")
+  
+  predicted_ratings <- test_edx %>%
+    left_join(b_i, by="movieId") %>%
+    mutate(pred = mu+b_i) %>%
+    pull(pred)
+  
+  rmse_movies <- RMSE(test_edx$rating, predicted_ratings)
+  rmse_results <- rmse_results %>% 
+    add_row(method="+ Movie effect", RMSE=rmse_movies)
+```
+
+**User effect**
+
+We can add the effect that each user has to its rating like this: 
+$$
+Y_{u,i} = \mu + b_i + b_u +\epsilon_{u,i}
+$$
+The least squares estimate of $b_u$ is just the the average of $Y_{u,i}-\hat \mu-\hat b_i$ for each user $u$.
+
+```{r user_effect}
+  b_u <- train_edx %>%
+    left_join(b_i, by='movieId') %>%
+    group_by(userId) %>%
+    summarize(b_u = mean(rating - mu - b_i), .groups = "keep")
+  
+  predicted_ratings <- test_edx %>%
+    left_join(b_u, by="userId") %>%
+    left_join(b_i, by="movieId") %>%
+    mutate(pred = mu+b_i+b_u) %>%
+    pull(pred)
+  
+  rmse_user <- RMSE(test_edx$rating, predicted_ratings)
+  rmse_results <- rmse_results %>% 
+    add_row(method="+ User effect", RMSE=rmse_user)
+```
+
+**Genre effect**
+
+We can add the effect that each genre combination has on the rating like this:
+$$
+Y_{u,i} = \mu + b_i + b_u + b_g + \epsilon_{u,i}
+$$
+The least squares estimate of $b_g$ is the the average of $Y_{u,i}-\hat \mu-\hat b_i-\hat b_u$ for each genre combination.
+
+```{r genre_effect}
+  b_g <- train_edx %>%
+    left_join(b_u, by="userId") %>%
+    left_join(b_i, by="movieId") %>%
+    group_by(genres) %>%
+    summarize(b_g = mean(rating - mu - b_i - b_u), .groups = "keep")
+  
+  predicted_ratings <- test_edx %>%
+    left_join(b_u, by="userId") %>%
+    left_join(b_i, by="movieId") %>%
+    left_join(b_g, by="genres") %>%
+    mutate(pred = mu+b_i+b_u+b_g) %>%
+    pull(pred)
+  
+  rmse_genres <- RMSE(test_edx$rating, predicted_ratings)
+  rmse_results <- rmse_results %>% 
+    add_row(method="+ Genre combo effect", RMSE=rmse_genres)
+```
+
+**Release year effect**
+
+We can add the effect that the year of release has on the rating like this:
+$$
+Y_{u,i} = \mu + b_i + b_u + b_g + b_r + \epsilon_{u,i}
+$$
+The least squares estimate of $b_r$ is the the average of $Y_{u,i}-\hat \mu-\hat b_i-\hat b_u-\hat b_g$ for each year.
+
+```{r releaseyear_effect}
+  b_r <- train_edx %>%
+    left_join(b_u, by="userId") %>%
+    left_join(b_i, by="movieId") %>%
+    left_join(b_g, by="genres") %>%
+    group_by(releaseyear) %>%
+    summarize(b_r = mean(rating - mu - b_i - b_u - b_g), .groups = "keep")
+  
+  predicted_ratings <- test_edx %>%
+    left_join(b_u, by="userId") %>%
+    left_join(b_i, by="movieId") %>%
+    left_join(b_g, by="genres") %>%
+    left_join(b_r, by="releaseyear") %>%
+    mutate(pred = mu+b_i+b_u+b_g+b_r) %>%
+    pull(pred)
+  
+  rmse_releaseyear <- RMSE(test_edx$rating, predicted_ratings)
+  rmse_results <- rmse_results %>% 
+    add_row(method="+ Release year effect", RMSE=rmse_releaseyear)
+```
+
+**Unique ratings effect**
+
+We can add the effect that each group of unique ratings has on the rating like this:
+$$
+Y_{u,i} = \mu + b_i + b_u + b_g + b_r + b_{ru} + \epsilon_{u,i}
+$$
+The least squares estimate of $b_{ru}$ is the the average of $Y_{u,i}-\hat \mu-\hat b_i-\hat b_u-\hat b_g-\hat b_r$ for each group of unique ratings.
+```{r unique_ratings_effect}
+  b_ru <- train_edx %>%
+    left_join(b_u, by="userId") %>%
+    left_join(b_i, by="movieId") %>%
+    left_join(b_g, by="genres") %>%
+    left_join(b_r, by="releaseyear") %>%
+    group_by(unique_ans) %>%
+    summarize(b_ru = mean(rating - mu - b_i - b_u - b_g - b_r), .groups = "keep")
+  
+  predicted_ratings <- test_edx %>%
+    left_join(b_u, by="userId") %>%
+    left_join(b_i, by="movieId") %>%
+    left_join(b_g, by="genres") %>%
+    left_join(b_r, by="releaseyear") %>%
+    left_join(b_ru, by="unique_ans") %>%
+    mutate(pred = mu+b_i+b_u+b_g+b_r+b_ru) %>%
+    pull(pred)
+  
+  rmse_uniqueans <- RMSE(test_edx$rating, predicted_ratings)
+  rmse_results <- rmse_results %>% 
+    add_row(method="+ Unique answers effect", RMSE=rmse_uniqueans)
+```
+
+**Model**
+
+So far our model for predicting the rating is:
+$$
+\hat Y_{u,i} = \mu + b_i + b_u + b_g + b_r + b_{ru}
+$$
+And our RMSE for the models are: 
+```{r, echo=FALSE, results='asis'}
+knitr::kable(rmse_results)
+```
+
+As we can see I reach a RMSE `r as.numeric(rmse_results[nrow(rmse_results),2])` which is lower that the RMSE objective of `r RMSE_target`. But of course this is not with the validation data, can we improve the RMSE? Yes! with regularization.
+```{r}
+as.numeric(rmse_results[nrow(rmse_results),2]) < RMSE_target
+```
+
+### Regularization
+
+Regularization consist in instead of instead of minimizing the least squares
+equation, instead we minimize an equation that adds a penalty. For example, for $b_i$ we minimize:
+
+$$
+\frac{1}{N} \sum_{u,i}(y_{u.i}-\mu-b_i)^2 + \lambda \sum_i b_i^2
+$$
+Which the values of $b_i$ that minimizes the equations, for each movie $i$, are:
+$$
+\hat b_i(\lambda) = \frac{1}{\lambda+n_i} \sum_{u=1}^{n_i}(Y_{u,i}-\hat\mu)
+$$
+
+For the next effect, which is the user effect, we can use regularization as well. But we are minimizing the following equation:
+$$
+\frac{1}{N} \sum_{u,i}(y_{u.i}-\mu-b_i-b_u)^2 + \lambda(\sum_i b_i^2+\sum_u b_u^2)
+$$
+And similarly for all other effects.
+
+```{r Regulartization,tidy=TRUE, tidy.opts=list(width.cutoff=80)}
+  lambdas <- seq(0, 10, 0.1)
+  
+  rmses_regularization <- sapply(lambdas, function(lambda){
+    
+    #Mean
+    mu <- mean(train_edx$rating)
+    
+    #Movie effect
+    b_i <- train_edx %>%
+      group_by(movieId) %>%
+      summarize(b_i = sum(rating - mu)/(n()+lambda), .groups = "keep")
+    
+    #User effect
+    b_u <- train_edx %>%
+      left_join(b_i, by='movieId') %>%
+      group_by(userId) %>%
+      summarize(b_u = sum(rating - mu - b_i)/(n()+lambda), .groups = "keep")
+    
+    #Genre combo effect
+    b_g <- train_edx %>%
+      left_join(b_u, by="userId") %>%
+      left_join(b_i, by="movieId") %>%
+      group_by(genres) %>%
+      summarize(b_g = sum(rating - mu - b_i - b_u)/(n()+lambda), .groups = "keep")
+    
+    #Release year effect
+    b_r <- train_edx %>%
+      left_join(b_u, by="userId") %>%
+      left_join(b_i, by="movieId") %>%
+      left_join(b_g, by="genres") %>%
+      group_by(releaseyear) %>%
+      summarize(b_r = sum(rating - mu - b_i - b_u - b_g)/(n()+lambda), .groups = "keep")
+    
+    #Unique rating effect
+    b_ru <- train_edx %>%
+      left_join(b_u, by="userId") %>%
+      left_join(b_i, by="movieId") %>%
+      left_join(b_g, by="genres") %>%
+      left_join(b_r, by="releaseyear") %>%
+      group_by(unique_ans) %>%
+      summarize(b_ru = mean(rating - mu - b_i - b_u - b_g - b_r)/(n()+lambda), .groups = "keep")
+    
+    #Predicted ratings
+    predicted_ratings <- test_edx %>%
+      left_join(b_u, by="userId") %>%
+      left_join(b_i, by="movieId") %>%
+      left_join(b_g, by="genres") %>%
+      left_join(b_r, by="releaseyear") %>%
+      left_join(b_ru, by="unique_ans") %>%
+      mutate(pred = mu+b_i+b_u+b_g+b_r+b_ru) %>%
+      pull(pred)
+    
+    return(RMSE(test_edx$rating, predicted_ratings))
+  })
+```
+
+```{r lambdas_plot,echo=FALSE}
+  qplot(lambdas, rmses_regularization) +
+    geom_hline(aes(yintercept = as.numeric(rmse_results[nrow(rmse_results),2])),
+               color="Blue") +
+    ggtitle("Lambda vs RMSE with regularization") +
+    geom_point(aes(y=rmses_regularization[which.min(rmses_regularization)],
+                   x=lambdas[which.min(rmses_regularization)]), color="red")
+```
+
+As we can see in the plot, where the blue line is the RMSE that we get before regularization, we get a lot of values of $\lambda$ which we get a lower RMSE, with $\lambda =$ `r lambdas[which.min(rmses_regularization)]` the best one (is the one with the red point).
+
+```{r rmse_best_lambda}
+  lambda <- lambdas[which.min(rmses_regularization)]
+
+  rmse_reg <- rmses_regularization[which.min(rmses_regularization)]
+  
+  rmse_results <- rmse_results %>% 
+    add_row(method="All effects + Regularization", RMSE=rmse_reg)
+  
+  knitr::kable(rmse_results)
+```
+
+As we can see in the above table, our RMSE with the test data set has a value of `r rmse_reg`. Of course we can find better models but because of my limitation with the hardware of my computer, I don't have the capacity to make a better one.
+
+# Results
+
+Now I'm going to train the final model with regularization with the whole edx data set. And test it with the validation data set.
+
+```{r edx_training, tidy=TRUE, tidy.opts=list(width.cutoff=80)}
+  #Mean
+  mu <- mean(edx$rating)
+  
+  #Movie effect
+  b_i <- edx %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+lambda), .groups = "keep")
+  
+  #User effect
+  b_u <- edx %>%
+    left_join(b_i, by='movieId') %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - mu - b_i)/(n()+lambda), .groups = "keep")
+  
+  #Genre combo effect
+  b_g <- edx %>%
+    left_join(b_u, by="userId") %>%
+    left_join(b_i, by="movieId") %>%
+    group_by(genres) %>%
+    summarize(b_g = sum(rating - mu - b_i - b_u)/(n()+lambda), .groups = "keep")
+  
+  #Release year effect
+  b_r <- edx %>%
+    left_join(b_u, by="userId") %>%
+    left_join(b_i, by="movieId") %>%
+    left_join(b_g, by="genres") %>%
+    group_by(releaseyear) %>%
+    summarize(b_r = sum(rating - mu - b_i - b_u - b_g)/(n()+lambda), .groups = "keep")
+  
+  #Unique rating effect
+  b_ru <- edx %>%
+    left_join(b_u, by="userId") %>%
+    left_join(b_i, by="movieId") %>%
+    left_join(b_g, by="genres") %>%
+    left_join(b_r, by="releaseyear") %>%
+    group_by(unique_ans) %>%
+    summarize(b_ru = mean(rating - mu - b_i - b_u - b_g - b_r)/(n()+lambda), .groups = "keep")
+  
+  #Predicted ratings
+  predicted_ratings <- validation %>%
+    left_join(b_u, by="userId") %>%
+    left_join(b_i, by="movieId") %>%
+    left_join(b_g, by="genres") %>%
+    left_join(b_r, by="releaseyear") %>%
+    left_join(b_ru, by="unique_ans") %>%
+    mutate(pred = mu+b_i+b_u+b_g+b_r+b_ru) %>%
+    pull(pred)
+  
+  #Validation RMSE
+  rmse_final <- RMSE(validation$rating, predicted_ratings)
+```
+
+In the end we get a RMSE of `r rmse_final`. Which is lower than the requested RMSE of `r RMSE_target`.
+
+```{r validation}
+rmse_final < RMSE_target
+```
+
+```{r,echo=FALSE}
+errors <- validation$rating - predicted_ratings
+errors <- as.data.frame(errors)
+```
+
+Some issues that I have with this model is that there are some predicted ratings beyond the expected range from 0.5 to 5, with `r round(mean(predicted_ratings < 0.5 | predicted_ratings > 5)*100,3)`% of the predictions been the case. With the lowest predicted value was of `r min(predicted_ratings)` and the highest was of `r max(predicted_ratings)`. 
+
+This can be "fixed" by rounding the predictions, but since the objective of this model is a recommendation algorithm, does a value greater than 5 means the user would really like that movie? I believe there is room for discussion if this is a problem after all.
+
+The errors have a mean of `r mean(errors$errors)` which is close to 0, which is what should we expect from a linear model.
+
+# Conclusion
+
+Although the final RMSE is better than the target set in the course, there is more work that could improve the RMSE.
+
+The first issue is the lack of more variables, for example the variable timestamp that I avoided for the reasons mentioned in the data analysis section. Other important variable for the rating could be the director of the movie which is not in the data set. Other relation can exist is between genres and year of release, i.e. genres have different eras of popularity which greatly affects movies quality and therefore their ratings.
+
+The second issue is with hardware limitations, of which if they didn't exist I could make a better algorithm that could use different models at the same time.
+
+So for a future work there are a lot of possibilities for improvement, but these improvements are restricted primarily by data availability and hardware.
+
+So in conclusion this report shows that I was successful in creating a model for predicting the ratings of movies, with the final objective of being a recommendation algorithm. Not only did I use variables directly given in the course, I modified said data to have more variables for the prediction. Which I think I met the objectives of the rubric. 
